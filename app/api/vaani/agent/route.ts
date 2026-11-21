@@ -8,7 +8,7 @@ export const dynamic = 'force-dynamic';
 const AVG_CONSULT_MINS = 7;
 const EMERGENCY_DELAY_BUFFER_MINS = 10;
 
-interface PendingBookingPayload {
+interface BookingPayload {
   patient_name?: string;
   name?: string;
   phone?: string;
@@ -19,6 +19,12 @@ interface PendingBookingPayload {
   visit_type?: string;
 }
 
+interface PendingActionShape {
+  type?: string;
+  payload?: BookingPayload;
+  data?: BookingPayload;
+}
+
 interface AgentRequestBody {
   text?: string;
   transcript?: string;
@@ -26,22 +32,18 @@ interface AgentRequestBody {
   intent?: string;
   role?: string;
   language?: string;
-  pendingAction?: {
-    type?: string;
-    payload?: PendingBookingPayload;
-    data?: PendingBookingPayload;
-  } | null;
+  confirm?: boolean;
+  pendingAction?: PendingActionShape | null;
   context?: {
-    pendingAction?: {
-      type?: string;
-      payload?: PendingBookingPayload;
-      data?: PendingBookingPayload;
-    } | null;
+    pendingAction?: PendingActionShape | null;
     patient_name?: string;
     name?: string;
     phone?: string;
+    age?: number | string;
+    gender?: string;
     department?: string;
     symptoms?: string;
+    visit_type?: string;
   };
 }
 
@@ -75,57 +77,87 @@ function openVaaniDb(): Database.Database {
   return db;
 }
 
-function isConfirmIntent(rawText: string, explicitIntent?: string): boolean {
-  if (explicitIntent === 'confirm_action' || explicitIntent === 'confirm_booking') {
+function isBookingOrConfirmIntent(rawText: string, explicitIntent?: string, confirmFlag?: boolean): boolean {
+  if (
+    confirmFlag === true ||
+    explicitIntent === 'confirm_action' ||
+    explicitIntent === 'confirm_booking' ||
+    explicitIntent === 'book_appointment'
+  ) {
     return true;
   }
+
   const normalized = rawText.toLowerCase().trim();
-  return [
+  if (!normalized) return false;
+
+  const triggers = [
+    // Roman / Hinglish / English
     'haan confirm',
+    'ha confirm',
     'confirm kar do',
     'confirm karo',
-    'haan pakka',
+    'confirm kardo',
+    'confirm',
+    'booking kr do',
+    'booking kar do',
+    'booking karo',
+    'book kr do',
     'book kar do',
     'book karo',
+    'book kardo',
     'haan book',
+    'ha book',
     'yes confirm',
-    'confirm',
+    'yes book',
     'haan',
     'ha',
-    'ok book',
-    'theek hai confirm',
-  ].some((phrase) => normalized === phrase || normalized.includes(phrase));
+    'ok',
+    'okay',
+    'theek hai',
+    'thik hai',
+    // Devanagari Hindi
+    'हां कंफर्म',
+    'हां कन्फर्म',
+    'कंफर्म कर दो',
+    'कन्फर्म कर दो',
+    'कंफर्म करो',
+    'कन्फर्म करो',
+    'बुकिंग कर दो',
+    'बुकिंग करो',
+    'बुक कर दो',
+    'बुक करो',
+    'हां बुक',
+    'हां',
+    'हाँ',
+    'ठीक है',
+  ];
+
+  return triggers.some((phrase) => normalized === phrase || normalized.includes(phrase));
 }
 
-function createAppointmentDirectly(payload: PendingBookingPayload) {
+function insertAppointment(payload: BookingPayload) {
   let db: Database.Database | null = null;
   try {
     db = openVaaniDb();
 
-    const patientName = String(
-      payload.patient_name || payload.name || 'Walk-in Patient'
-    ).trim();
+    const patientName = String(payload.patient_name || payload.name || 'Walk-in Patient').trim();
     const phone = String(payload.phone || '').trim() || null;
-    const department = String(payload.department || 'General Medicine').trim();
-    const symptoms = String(payload.symptoms || 'General consultation').trim();
-    const visitType = String(payload.visit_type || 'OPD').trim();
-    const parsedAge =
-      payload.age !== undefined && payload.age !== null && String(payload.age).trim() !== ''
-        ? Number(payload.age)
-        : null;
+    const department = String(payload.department || 'General Medicine').trim() || 'General Medicine';
+    const symptoms = String(payload.symptoms || 'General consultation').trim() || 'General consultation';
+    const visitType = String(payload.visit_type || 'OPD').trim() || 'OPD';
+    const rawAge = payload.age !== undefined && payload.age !== null ? Number(payload.age) : NaN;
+    const age = Number.isFinite(rawAge) && rawAge > 0 ? Math.floor(rawAge) : null;
     const gender = String(payload.gender || '').trim() || null;
 
-    const maxTokenRow = db
+    const maxRow = db
       .prepare('SELECT COALESCE(MAX(token_number), 0) AS maxToken FROM appointments')
       .get() as { maxToken?: number } | undefined;
+    const nextToken = Number(maxRow?.maxToken || 0) + 1;
 
-    const nextToken = Number(maxTokenRow?.maxToken || 0) + 1;
-
-    const waitingCountRow = db
+    const waitRow = db
       .prepare("SELECT COUNT(*) AS cnt FROM appointments WHERE status = 'waiting'")
       .get() as { cnt?: number } | undefined;
-
-    const waitingCount = Number(waitingCountRow?.cnt || 0);
+    const waitingCount = Number(waitRow?.cnt || 0);
     const estimatedWaitMins =
       waitingCount * AVG_CONSULT_MINS + (waitingCount > 0 ? EMERGENCY_DELAY_BUFFER_MINS : 0);
 
@@ -144,7 +176,7 @@ function createAppointmentDirectly(payload: PendingBookingPayload) {
       patientId,
       patientName,
       phone,
-      Number.isFinite(parsedAge as number) ? parsedAge : null,
+      age,
       gender,
       department,
       symptoms,
@@ -161,8 +193,11 @@ function createAppointmentDirectly(payload: PendingBookingPayload) {
         patient_id: patientId,
         patient_name: patientName,
         phone,
+        age,
+        gender,
         department,
         symptoms,
+        visit_type: visitType,
         token_number: nextToken,
         status: 'waiting',
         estimated_wait_mins: estimatedWaitMins,
@@ -172,7 +207,7 @@ function createAppointmentDirectly(payload: PendingBookingPayload) {
   } catch (err) {
     return {
       ok: false as const,
-      error: err instanceof Error ? err.message : 'Unknown database error',
+      error: err instanceof Error ? err.message : 'Database booking error',
     };
   } finally {
     db?.close();
@@ -182,9 +217,7 @@ function createAppointmentDirectly(payload: PendingBookingPayload) {
 export async function POST(req: Request) {
   try {
     const body = (await req.json().catch(() => ({}))) as AgentRequestBody;
-    const transcript = String(
-      body.text ?? body.transcript ?? body.message ?? ''
-    ).trim();
+    const transcript = String(body.text ?? body.transcript ?? body.message ?? '').trim();
     const role = String(body.role || 'patient').trim();
 
     const agoraConfig = {
@@ -192,23 +225,23 @@ export async function POST(req: Request) {
       maxSessionSeconds: 180,
     };
 
-    if (isConfirmIntent(transcript, body.intent)) {
-      const pendingPayload: PendingBookingPayload = {
+    if (isBookingOrConfirmIntent(transcript, body.intent, body.confirm)) {
+      const mergedPayload: BookingPayload = {
         ...(body.context || {}),
-        ...(body.pendingAction?.payload || {}),
-        ...(body.pendingAction?.data || {}),
         ...(body.context?.pendingAction?.payload || {}),
         ...(body.context?.pendingAction?.data || {}),
+        ...(body.pendingAction?.payload || {}),
+        ...(body.pendingAction?.data || {}),
       };
 
-      const bookingRes = createAppointmentDirectly(pendingPayload);
+      const result = insertAppointment(mergedPayload);
 
-      if (!bookingRes.ok) {
+      if (!result.ok) {
         return NextResponse.json({
           success: true,
           intent: 'confirm_action',
           transcriptHinglish: transcript,
-          replyText: `Main Vaani AI hoon. Booking error aaya: ${bookingRes.error}`,
+          replyText: `Booking karte waqt dikkat aayi: ${result.error}`,
           audioUrl: null,
           pendingAction: null,
           toolResult: null,
@@ -216,12 +249,12 @@ export async function POST(req: Request) {
         });
       }
 
-      const apt = bookingRes.appointment;
+      const apt = result.appointment;
       return NextResponse.json({
         success: true,
         intent: 'confirm_action',
         transcriptHinglish: transcript,
-        replyText: `Aapki appointment confirm ho gayi hai! Token number #${apt.token_number} (${apt.patient_name}, ${apt.department}). Aestimated wait lagbhag ${apt.estimated_wait_mins} minute hai.`,
+        replyText: `Aapki appointment book ho gayi hai! Token #${apt.token_number} (${apt.patient_name}, ${apt.department}). Aestimated wait ${apt.estimated_wait_mins} minute hai.`,
         audioUrl: null,
         pendingAction: null,
         toolResult: {
@@ -238,8 +271,8 @@ export async function POST(req: Request) {
       transcriptHinglish: transcript,
       replyText:
         role === 'doctor'
-          ? 'Namaste Doctor. Queue aur patient status ready hai. Kya aap agla token call karna chahte hain?'
-          : 'Namaste! Main Vaani AI hoon. Kripya apna naam, phone number aur problem bataiye, ya booking confirm karne ke liye "haan confirm kar do" boliye.',
+          ? 'Namaste Doctor. Queue aur patient status live hai. Kya aap agla patient call karna chahte hain?'
+          : 'Namaste! Main Vaani AI hoon. Booking karne ya confirm karne ke liye "booking kar do" ya "haan confirm kar do" boliye ya type kijiye.',
       audioUrl: null,
       pendingAction: {
         type: 'book_appointment',
@@ -258,7 +291,7 @@ export async function POST(req: Request) {
         success: false,
         intent: 'error',
         transcriptHinglish: '',
-        replyText: `Main Vaani AI hoon. Request process nahi ho paayi: ${
+        replyText: `Vaani AI service mein error aaya: ${
           err instanceof Error ? err.message : 'Unexpected error'
         }`,
         audioUrl: null,
