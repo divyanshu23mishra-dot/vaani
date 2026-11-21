@@ -1,124 +1,89 @@
 import { NextResponse } from 'next/server';
 import Database from 'better-sqlite3';
 import path from 'path';
+import fs from 'fs';
 
-const dbPath = path.resolve(process.cwd(), 'data/relay.db');
-const db = new Database(dbPath);
+export const dynamic = 'force-dynamic';
 
 const AVG_CONSULT_MINS = 7;
 const EMERGENCY_DELAY_BUFFER_MINS = 10;
 
-interface AptRow {
-  id: string;
-  doctor_id: string;
-  token_number: number;
-  status: 'waiting' | 'in_progress' | 'completed' | 'cancelled' | 'emergency_delayed';
-  chief_complaint: string;
-  patient_name: string | null;
-  patient_phone: string | null;
+function openStatusDb(): Database.Database {
+  const dataDir = path.resolve(process.cwd(), 'data');
+  if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+  }
+  const db = new Database(path.join(dataDir, 'relay.db'));
+  db.pragma('foreign_keys = OFF');
+  return db;
 }
 
 export async function GET(req: Request) {
+  let db: Database.Database | null = null;
   try {
+    db = openStatusDb();
     const { searchParams } = new URL(req.url);
-    const digits = String(searchParams.get('phone') || '').replace(/\D/g, '');
+    const phone = String(searchParams.get('phone') || '').trim();
+    const tokenParam = String(searchParams.get('token') || '').trim();
 
-    if (digits.length !== 10) {
-      return NextResponse.json(
-        { error: 'Please enter a valid 10-digit mobile number' },
-        { status: 400 }
-      );
+    const tableExists = db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='appointments'")
+      .get() as { name?: string } | undefined;
+
+    if (!tableExists?.name) {
+      return NextResponse.json({
+        appointment: null,
+        queueAhead: 0,
+        estimatedWaitMins: 0,
+      });
     }
 
-    const allRows = db
-      .prepare(
-        `SELECT
-          a.id,
-          a.doctor_id,
-          a.token_number,
-          a.status,
-          a.chief_complaint,
-          p.name AS patient_name,
-          p.phone AS patient_phone
-        FROM appointments a
-        LEFT JOIN patients p ON p.id = a.patient_id
-        ORDER BY a.token_number ASC`
-      )
-      .all() as AptRow[];
-
-    const hasEmergencyDelay = allRows.some((r) => r.status === 'emergency_delayed');
-    let ahead = 0;
-
-    const withEstimates = allRows.map((row) => {
-      if (row.status === 'completed' || row.status === 'cancelled') {
-        return { ...row, patients_ahead: 0, estimated_wait_mins: 0 };
-      }
-      if (row.status === 'in_progress') {
-        ahead += 1;
-        return { ...row, patients_ahead: 0, estimated_wait_mins: 0 };
-      }
-      const patientsAhead = ahead;
-      const waitMins =
-        patientsAhead * AVG_CONSULT_MINS + (hasEmergencyDelay ? EMERGENCY_DELAY_BUFFER_MINS : 0);
-      if (row.status === 'waiting' || row.status === 'emergency_delayed') {
-        ahead += 1;
-      }
-      return { ...row, patients_ahead: patientsAhead, estimated_wait_mins: waitMins };
-    });
-
-    const matched = withEstimates.filter((r) => {
-      const pDigits = String(r.patient_phone || '').replace(/\D/g, '');
-      return pDigits.endsWith(digits);
-    });
-
-    const hasRxTable = Boolean(
-      db
-        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='prescriptions'")
-        .get()
-    );
-
-    let prescriptions: unknown[] = [];
-    if (hasRxTable && matched.length > 0) {
-      const rxCols = new Set(
-        (db.prepare('PRAGMA table_info(prescriptions)').all() as Array<{ name: string }>).map(
-          (c) => c.name
-        )
-      );
-      if (rxCols.has('appointment_id')) {
-        const ids = matched.map((m) => m.id);
-        const placeholders = ids.map(() => '?').join(', ');
-        prescriptions = db
-          .prepare(
-            `SELECT
-              pr.id,
-              pr.appointment_id,
-              pr.medicines,
-              ${rxCols.has('notes') ? 'pr.notes' : 'NULL AS notes'},
-              ${
-                rxCols.has('pharmacy_status')
-                  ? "COALESCE(pr.pharmacy_status, 'pending')"
-                  : "'pending'"
-              } AS pharmacy_status,
-              a.token_number
-            FROM prescriptions pr
-            LEFT JOIN appointments a ON a.id = pr.appointment_id
-            WHERE pr.appointment_id IN (${placeholders})
-            ORDER BY pr.rowid DESC`
-          )
-          .all(...ids);
-      }
+    let appointment: Record<string, unknown> | undefined;
+    if (tokenParam && /^\d+$/.test(tokenParam)) {
+      appointment = db
+        .prepare('SELECT * FROM appointments WHERE token_number = ? ORDER BY rowid DESC LIMIT 1')
+        .get(Number(tokenParam)) as Record<string, unknown> | undefined;
+    } else if (phone) {
+      appointment = db
+        .prepare('SELECT * FROM appointments WHERE phone = ? ORDER BY rowid DESC LIMIT 1')
+        .get(phone) as Record<string, unknown> | undefined;
+    } else {
+      appointment = db
+        .prepare("SELECT * FROM appointments WHERE status IN ('waiting', 'in_progress') ORDER BY token_number ASC LIMIT 1")
+        .get() as Record<string, unknown> | undefined;
     }
+
+    if (!appointment) {
+      return NextResponse.json({
+        appointment: null,
+        queueAhead: 0,
+        estimatedWaitMins: 0,
+      });
+    }
+
+    const tokenNumber = Number(appointment.token_number || 0);
+    const aheadRow = db
+      .prepare("SELECT COUNT(*) as cnt FROM appointments WHERE status = 'waiting' AND token_number < ?")
+      .get(tokenNumber) as { cnt?: number } | undefined;
+
+    const queueAhead = Number(aheadRow?.cnt || 0);
+    const estimatedWaitMins =
+      appointment.status === 'completed'
+        ? 0
+        : queueAhead * AVG_CONSULT_MINS + (queueAhead > 0 ? EMERGENCY_DELAY_BUFFER_MINS : 0);
 
     return NextResponse.json({
-      success: true,
-      appointments: matched,
-      prescriptions,
+      appointment,
+      queueAhead,
+      estimatedWaitMins,
     });
   } catch (err) {
-    console.error('Patient status error:', err);
+    console.error('GET /api/vaani/patient-status error:', err);
     return NextResponse.json(
-      { error: err instanceof Error ? err.message : 'Internal server error' },
+      { error: err instanceof Error ? err.message : 'Failed to fetch patient status' },
       { status: 500 }
     );
+  } finally {
+    db?.close();
   }
 }
